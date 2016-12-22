@@ -6,13 +6,16 @@ import java.io.BufferedWriter;
 import java.io.FileWriter;
 import java.util.ArrayList;
 import java.util.Hashtable;
+import java.util.StringTokenizer;
 
 public class UCodeGenListener extends MiniCBaseListener {
 
 	private ParseTreeProperty<String> newTexts;
 	private ArrayList<Hashtable<String, Integer>> variables; // hashtable<variable name, sequence>
-	private Hashtable<String, Integer> functions; // hashtable<function name, function number>
+	private Hashtable<String, Boolean> functions; // hashtable<function name, function type>
+	private ArrayList<BasicBlock> blockList;
 
+	private String currentFunctionName = null;
 	private int globalVariables = 0; // the number of global variables
 	private int localVariables = 0; // the number of local variables of each function
 	private int functionNumber = 0; // the number of functions
@@ -20,13 +23,20 @@ public class UCodeGenListener extends MiniCBaseListener {
 	private int var_decls = 0; // the number of 'var_decl'
 	private int whiles = 0; // the number of 'while' keywords
 	private int ifs = 0; // the number of 'if' keywords
+	
 	private boolean hasReturnStatement = false; // if a function has the return type void
+	private boolean isIntegerFunction = false; // true: integer return type, false: void
+	private boolean functionCallType = true; // true: return integer, false: void
 
 	public UCodeGenListener() {
 		super();
 		newTexts = new ParseTreeProperty<String>();
 		variables= new ArrayList<Hashtable<String, Integer>>();
-		functions = new Hashtable<String, Integer>();
+		blockList = new ArrayList<BasicBlock>();
+		functions = new Hashtable<String, Boolean>();
+		functions.put("write", false);
+		functions.put("read", false);
+		functions.put("lf", false);
 		
 		variables.add(new Hashtable<String, Integer>()); // global variables
 	}
@@ -34,6 +44,8 @@ public class UCodeGenListener extends MiniCBaseListener {
 	@Override
 	public void exitProgram(MiniCParser.ProgramContext ctx) {
 		StringBuilder line = new StringBuilder();
+		StringBuilder graph = new StringBuilder();
+		StringBuilder optimizeCode = new StringBuilder();
 
 		// fun_decl
 		for (int index = var_decls, declSize = ctx.getChildCount(); index < declSize; index++)
@@ -57,6 +69,155 @@ public class UCodeGenListener extends MiniCBaseListener {
 			writer.close();
 		} catch (IOException error) {
 			System.out.println(error.toString());
+		}
+		
+		// get basic block
+		String[] instruction = line.toString().split("\n");
+		boolean[] isHeader = new boolean[instruction.length];
+		isHeader[0] = true;
+		blockList.add(new BasicBlock("ENTRY")); // make entry node
+		
+		for (int index = 0; index < instruction.length; index++) {
+			StringTokenizer parser = new StringTokenizer(instruction[index]);
+			
+			if (isBranch(parser.nextToken())) {
+				String target = parser.nextToken();
+				
+				// find target
+				for (int jndex = 0; jndex < instruction.length; jndex++)
+					if (target.equals(new StringTokenizer(instruction[jndex]).nextToken())) {
+						isHeader[jndex] = true;
+						break;
+					}
+				
+				isHeader[index + 1] = true;
+			}
+		}
+		
+		ArrayList<String> labelList = new ArrayList<>();
+		ArrayList<String> noLabelList = new ArrayList<>();
+		labelList.add("L" + 0 + ": " + instruction[0]);
+		noLabelList.add(instruction[0]);
+		for (int index = 1; index < instruction.length; index++) {
+			if (!isHeader[index]) {
+				labelList.add("L" + index + ": " + instruction[index]);
+				noLabelList.add(instruction[index]);
+			} else {
+				blockList.add(new BasicBlock(String.valueOf(BasicBlock.blockSize++), labelList, noLabelList));
+				labelList.clear();
+				noLabelList.clear();
+				labelList.add("L" + index + ": " + instruction[index]);
+				noLabelList.add(instruction[index]);
+			}
+		}
+		blockList.add(new BasicBlock(String.valueOf(BasicBlock.blockSize++), labelList, noLabelList));
+		labelList.clear();
+		noLabelList.clear();
+		blockList.add(new BasicBlock("EXIT")); // make exit node
+		
+		
+		for (int index = 0; index < blockList.size(); index++) {
+			graph.append(blockList.get(index).print()).append("\n");
+		}
+		
+		// set entry node's Successors and Predecessors
+		blockList.get(0).addSuccessors(blockList.get(1));
+		blockList.get(1).addPredecessor(blockList.get(0));
+		
+		for (int index = 1; index < blockList.size() - 1; index++) {
+			ArrayList<String> labels = blockList.get(index).labels;
+			String instr = labels.get(labels.size() - 1);
+			StringTokenizer parser = new StringTokenizer(instr);
+			
+			parser.nextToken();
+			String opJump = parser.nextToken();
+			if (isBranch(opJump)) {
+				String target = parser.nextToken();
+				
+				for (int jndex = 1; jndex < blockList.size(); jndex++) {
+					String header = blockList.get(jndex).labels.get(0).split(" ")[1];
+					
+					if (header.equals(target)) {
+						if (opJump.equals("fjp")) { // fjp
+							blockList.get(index).addSuccessors(blockList.get(index + 1));
+							blockList.get(index).addSuccessors(blockList.get(jndex));
+							blockList.get(index + 1).addPredecessor(blockList.get(index));
+							blockList.get(jndex).addPredecessor(blockList.get(index));
+						} 
+						else { // ujp
+							blockList.get(index).addSuccessors(blockList.get(jndex));
+							blockList.get(jndex).addPredecessor(blockList.get(index));
+						}
+						
+						break;
+					}
+				}
+			} else {
+				blockList.get(index + 1).addPredecessor(blockList.get(index));
+				blockList.get(index).addSuccessors(blockList.get(index + 1));
+			}
+		}
+		
+		for (int index = 0; index < blockList.size(); index++) {
+			if (index == 0)
+				graph.append("BB ENTRY:\n" + blockList.get(index).toString()).append("\n");
+			else if (index == blockList.size() - 1)
+				graph.append("BB EXIT:\n" + blockList.get(index).toString()).append("\n");
+			else 
+				graph.append("BB " + index + ":\n" + blockList.get(index).toString()).append("\n");
+		}
+		
+		System.out.println(graph.toString());
+		try {
+			BufferedWriter writer = new BufferedWriter(new FileWriter("cfg.txt"));
+			writer.write(graph.toString());
+			writer.close();
+		} catch (IOException error) {
+			System.out.println(error.toString());
+		}
+		
+		// Unreachable Code Elimination
+		boolean[] visited = new boolean[blockList.size()];
+		mark(blockList.get(0), visited);
+		
+		for (int index = 0; index < blockList.size(); index++) {
+			if (visited[index])
+				optimizeCode.append(blockList.get(index).printCode());
+		}
+		
+		System.out.println(optimizeCode.toString());
+		try {
+			BufferedWriter writer = new BufferedWriter(new FileWriter("optimize_ucode.uco"));
+			writer.write(optimizeCode.toString());
+			writer.close();
+		} catch (IOException error) {
+			System.out.println(error.toString());
+		}
+	}
+	
+	private void mark(BasicBlock currentBB, boolean[] visited) {
+		int index = 0;
+		String blockNumber = currentBB.blockNumber;
+		
+		if (blockNumber.equals("ENTRY"))
+			index = 0;
+		else if (blockNumber.equals("EXIT"))
+			index = blockList.size() - 1;
+		else
+			index = Integer.parseInt(blockNumber);
+		
+		visited[index] = true;
+		
+		for (BasicBlock sucessor : currentBB.successors) {
+			if (sucessor.blockNumber.equals("ENTRY"))
+				index = 0;
+			else if (sucessor.blockNumber.equals("EXIT"))
+				index = blockList.size() - 1;
+			else
+				index = Integer.parseInt(sucessor.blockNumber);
+			
+			if (!visited[index])
+				mark(sucessor, visited);
 		}
 	}
 
@@ -82,18 +243,31 @@ public class UCodeGenListener extends MiniCBaseListener {
 		}
 
 		// type_spec IDENT '=' LITERAL ';'
-		if (ctx.getChildCount() == 5) {
+		if (ctx.getChildCount() == 5  && ctx.IDENT(1) == null) {
 			++globalVariables;
 			line.append(Keyword.SYM).append("1 ").append(globalVariables).append(" 1\n");
 			line.append(Keyword.LDC).append(numeration(ctx.LITERAL().getText())).append("\n");
 			line.append(Keyword.STR).append("1 ").append(globalVariables).append("\n");
 			variables.get(0).put(ctx.IDENT(0).getText(), globalVariables);
 		}
+		
+		// type_spec IDENT '=' IDENT ';'
+		if (ctx.getChildCount() == 5 && ctx.IDENT(1) != null) {
+			String name = ctx.IDENT(1).getText();
+			int location = findVariableLocation(name);
+			int sequence = variables.get((location == 1) ? 0 : functionNumber).get(name);
+			++globalVariables;
+			
+			line.append(Keyword.SYM).append("1 ").append(globalVariables).append(" 1\n");
+			line.append(Keyword.LOD).append(location + " ").append(sequence).append("\n");
+			line.append(Keyword.STR).append("1 ").append(globalVariables).append("\n");
+			variables.get(functionNumber).put(ctx.IDENT(0).getText(), globalVariables);
+		}
 				
 		// type_spec IDENT '[' LITERAL ']' ';'
 		if (ctx.getChildCount() == 6) {
 			int arraySize = Integer.parseInt(numeration(ctx.LITERAL().getText()));
-			String arrayName = ctx.IDENT().getText();
+			String arrayName = ctx.IDENT(0).getText();
 			
 			++globalVariables;
 			line.append(Keyword.SYM).append("1 ").append(globalVariables + " ").append(arraySize + 1).append("\n");
@@ -111,8 +285,11 @@ public class UCodeGenListener extends MiniCBaseListener {
 	@Override
 	public void enterFun_decl(MiniCParser.Fun_declContext ctx) {
 		localVariables = 0;
-		functions.put(ctx.IDENT().getText(), ++functionNumber);
+		functions.put(ctx.IDENT().getText(), ctx.type_spec().getText().equals("int") ? true : false);
 		variables.add(new Hashtable<String, Integer>()); // local variables
+		isIntegerFunction = ctx.type_spec().getText().equals("int") ? true : false;
+		currentFunctionName = ctx.IDENT().getText();
+		functionNumber++;
 	}
 
 	@Override
@@ -126,6 +303,11 @@ public class UCodeGenListener extends MiniCBaseListener {
 		line.append(newTexts.get(ctx.compound_stmt()));
 		line.append(hasReturnStatement ? "" : Keyword.RET + "\n");
 		line.append(Keyword.END).append("\n");
+		
+		if (isIntegerFunction && !hasReturnStatement) {
+			System.err.println("Compile Error: non-void function '" + currentFunctionName + "' should return a value");
+			System.exit(0);
+		}
 		
 		hasReturnStatement = false;
 		newTexts.put(ctx, line.toString());
@@ -248,16 +430,21 @@ public class UCodeGenListener extends MiniCBaseListener {
 			String name = ctx.IDENT().getText();
 			int location = findVariableLocation(name);
 			int sequence = variables.get((location == 1) ? 0 : functionNumber).get(name);
-
+			
 			if (name.split("")[0].equals("*")) { // for Pointer
 				line.append(Keyword.LOD).append(location + " ").append(sequence).append("\n");
 				line.append(newTexts.get(ctx.expr(0)));
-				line.append(Keyword.STI).append("\n");	
+				line.append(Keyword.STI).append("\n");
 			} else {
 				line.append(newTexts.get(ctx.expr(0)));
 				line.append(Keyword.STR).append(location + " ").append(sequence).append("\n");
 			}
-		} 
+			
+			if (!functionCallType) {
+				System.err.println("Compile Error: initializing 'int' with an expression of incompatible type 'void'");
+				System.exit(0);
+			}
+		}
 		else if (isArrayAssignmentOperation(ctx)) { // IDENT '[' expr ']' '=' expr
 			String name = ctx.IDENT().getText();
 			int location = findVariableLocation(name);
@@ -287,6 +474,7 @@ public class UCodeGenListener extends MiniCBaseListener {
 			line.append(Keyword.LDP).append("\n");
 			line.append(newTexts.get(ctx.args()));
 			line.append(Keyword.CALL).append(ctx.IDENT()).append("\n");
+			functionCallType = functions.get(ctx.IDENT().getText());
 		} 
 		else if (isBracketOperation(ctx)) { // '(' expr ')'
 			line.append(newTexts.get(ctx.expr(0)));
@@ -447,6 +635,7 @@ public class UCodeGenListener extends MiniCBaseListener {
 	public void exitIf_stmt(MiniCParser.If_stmtContext ctx) {
 		StringBuilder line = new StringBuilder();
 		String ifName = Keyword.IF + ifs;
+		String ifOutName = Keyword.IFOUT + ifs;
 
 		// IF '(' expr ')' stmt
 		if (ctx.getChildCount() == 5) {
@@ -461,8 +650,10 @@ public class UCodeGenListener extends MiniCBaseListener {
 			line.append(newTexts.get(ctx.expr()));
 			line.append(Keyword.FJP).append(ifName).append("\n");
 			line.append(newTexts.get(ctx.stmt(0)));
+			line.append(Keyword.UJP).append(ifOutName).append("\n");
 			line.append(ifName).append(Keyword.SPACE[indentation(ifName)]).append(Keyword.NOP).append("\n");
 			line.append(newTexts.get(ctx.stmt(1)));
+			line.append(ifOutName).append(Keyword.SPACE[indentation(ifOutName)]).append(Keyword.NOP).append("\n");
 		}
 
 		newTexts.put(ctx, line.toString());
@@ -473,13 +664,24 @@ public class UCodeGenListener extends MiniCBaseListener {
 		StringBuilder line = new StringBuilder();
 
 		// RETURN ';'
-		if (ctx.getChildCount() == 2)
+		if (ctx.getChildCount() == 2) {
 			line.append(Keyword.RET).append("\n");
-
+			
+			if (isIntegerFunction) {
+				System.err.println("Compile Error: non-void function '" + currentFunctionName + "' should return a value");
+				System.exit(0);
+			}
+		}
+		
 		// RETURN expr ';'
 		if (ctx.getChildCount() == 3) {
 			line.append(newTexts.get(ctx.expr()));
 			line.append(Keyword.RETV).append("\n");
+			
+			if (!isIntegerFunction) {
+				System.err.println("Compile Error: void function '" + currentFunctionName + "' should not return a value");
+				System.exit(0);
+			}
 		}
 
 		hasReturnStatement = true;
@@ -523,18 +725,19 @@ public class UCodeGenListener extends MiniCBaseListener {
 	}
 
 	private int findVariableLocation(String name) {
-		if (variables.get(functionNumber).containsKey(name)) // find local variable of current function
+		if (functionNumber != 0 && variables.get(functionNumber).containsKey(name)) // find local variable of current function
 			return 2;
 		if (variables.get(0).containsKey(name)) // find global variable
 			return 1;
 		
 		// compile error
-        System.err.println("Compile error: Use of undeclared identifier '" + name + '"');
+        System.err.println("Compile Error: Use of undeclared identifier '" + name + '"');
         System.exit(0);
         
 		return 0;
 	}
 
+	
 	private boolean isAssignmentOperation(ParserRuleContext parserRuleContext) {
 		return (parserRuleContext.getChildCount() == 3) && (parserRuleContext.getChild(1).getText().equals("="));
 	}
@@ -650,8 +853,12 @@ public class UCodeGenListener extends MiniCBaseListener {
 				&& (value.charAt(0) == '0') 
 				&& (value.charAt(1) == 'x' || value.charAt(1) == 'X');
 	}
-	
+
 	private boolean isOctalNumber(String value) {
 		return (value.length() >= 2) && (value.charAt(0) == '0');
+	}
+	
+	private boolean isBranch(String value) {
+		return (value.equals("ujp")) || (value.equals("fjp"));
 	}
 }
